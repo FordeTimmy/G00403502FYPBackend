@@ -1,2 +1,14 @@
-serviceAccountKey.json
+# Dependencies
 node_modules/
+
+# Environment variables
+.env
+.env.*
+
+# Firebase
+*-firebase-adminsdk-*.json
+serviceAccountKey.json
+
+# misc
+.DS_Store
+*.pem
