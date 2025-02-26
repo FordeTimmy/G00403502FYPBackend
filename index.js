@@ -45,6 +45,33 @@ app.post('/api/login', (req, res) => {
   return res.status(401).json({ message: "Invalid email or password" });
 });
 
+// Token Verification Route
+app.post('/api/verify-token', async (req, res) => {
+    console.log("Received request body:", req.body); // Debug incoming data
+
+    const { firebaseToken } = req.body;
+
+    if (!firebaseToken) {
+        console.log("No token provided in request"); // Debug missing token
+        return res.status(400).json({ message: "No token provided" });
+    }
+
+    try {
+        // Verify Firebase ID Token
+        const decodedToken = await admin.auth().verifyIdToken(firebaseToken);
+        console.log("Decoded Firebase Token:", decodedToken); // Check decoding
+
+        // Generate a JWT for your backend
+        const token = jwt.sign({ email: decodedToken.email }, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRES_IN });
+
+        console.log("JWT generated successfully"); // Debug successful token generation
+        res.json({ message: "Token verified successfully!", token });
+    } catch (error) {
+        console.error("Error verifying Firebase token:", error);
+        res.status(403).json({ message: "Invalid Firebase token", error: error.message });
+    }
+});
+
 // Firebase Protected route
 app.post('/api/protected', async (req, res) => {
     const token = req.headers.authorization?.split(' ')[1];
