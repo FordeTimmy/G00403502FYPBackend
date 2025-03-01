@@ -8,6 +8,7 @@ node_modules/
 # Firebase
 *-firebase-adminsdk-*.json
 serviceAccountKey.json
+blackjack-7de19-firebase-adminsdk.json
 
 # misc
 .DS_Store

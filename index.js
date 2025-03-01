@@ -6,12 +6,34 @@ const nodemailer = require("nodemailer");
 require('dotenv').config();
 
 // Initialize Firebase Admin
-const serviceAccount = require(process.env.FIREBASE_SERVICE_ACCOUNT_KEY_PATH);
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount)
-});
+try {
+    const serviceAccount = require("./blackjack-7de19-firebase-adminsdk.json");
+    admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount),
+        databaseURL: "https://blackjack-7de19.firebaseio.com"
+    });
+    console.log("✅ Firebase Admin SDK initialized successfully!");
 
-// Configure Nodemailer with Gmail SMTP
+    // Test Firestore connection only
+    (async () => {
+        try {
+            const testRef = admin.firestore().collection("test_collection");
+            await testRef.add({
+                testField: "Hello, Firestore!",
+                timestamp: admin.firestore.FieldValue.serverTimestamp(),
+            });
+            console.log("✅ Firestore write test successful!");
+        } catch (error) {
+            console.error("❌ Firestore write test failed:", error);
+            process.exit(1);
+        }
+    })();
+} catch (error) {
+    console.error("❌ Firebase Admin SDK initialization failed:", error);
+    process.exit(1);
+}
+
+// Configure Nodemailer with Gmail SMTP - but don't send test email
 const transporter = nodemailer.createTransport({
     service: 'gmail',
     auth: {
@@ -20,27 +42,26 @@ const transporter = nodemailer.createTransport({
     }
 });
 
-// Function to send an email
+// Function to send an email - kept for actual currency code sends
 const sendEmail = async (to, currencyCode) => {
     const mailOptions = {
         from: `"Blackjack Rewards" <${process.env.EMAIL_USER}>`,
         to: to,
         subject: "Your Daily Blackjack Bonus 🎰",
-        text: `Here is your one-time currency code: ${currencyCode}\n\nUse this code in the game to get your daily bonus!`
+        text: `Here is your one-time currency code: ${currencyCode}\n\nUse this code in the game to get your daily bonus of 1000 coins!`
     };
 
     try {
         await transporter.sendMail(mailOptions);
         console.log(`Currency code ${currencyCode} sent to ${to}`);
+        return true;
     } catch (error) {
         console.error("Error sending email:", error);
+        return false;
     }
 };
 
-// Test email send
-sendEmail("timmyforde02@gmail.com", "BLACKJACK-TEST123")
-    .then(() => console.log("Test email sent successfully"))
-    .catch(error => console.error("Test email failed:", error));
+// Remove test email send
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -85,7 +106,6 @@ app.post('/api/login', async (req, res) => {
         res.status(403).json({ message: "Invalid Firebase token" });
     }
 });
-
 
 // Token Verification Route
 app.post('/api/verify-token', async (req, res) => {
@@ -135,28 +155,229 @@ app.post('/api/protected', async (req, res) => {
     }
 });
 
-// Currency Code Email Route
+// Currency Code Email Route (Sends bonus every X minutes)
 app.post('/api/send-currency-code', authenticateToken, async (req, res) => {
     const { email } = req.user;
-
-    if (!email) {
-        return res.status(400).json({ message: "Email is required" });
-    }
-
-    const currencyCode = `BLACKJACK-${Math.random().toString(36).substr(2, 8).toUpperCase()}`;
+    const MINUTES_BETWEEN_CLAIMS = 5; // Adjust this value as needed
 
     try {
+        console.log(`Checking last claim time for ${email}...`);
+        const currencyRef = admin.firestore().collection("currency_codes");
+        
+        // Get most recent code for this user
+        const snapshot = await currencyRef
+            .where("email", "==", email)
+            .orderBy("createdAt", "desc")
+            .limit(1)
+            .get();
+
+        if (!snapshot.empty) {
+            const lastClaim = snapshot.docs[0].data().createdAt;
+            const timeSinceLastClaim = (Date.now() - lastClaim.toMillis()) / (1 * 60 * 1000 // = 60000 milliseconds (1 minute)
+            ); // Convert to minutes
+
+            if (timeSinceLastClaim < MINUTES_BETWEEN_CLAIMS) {
+                const timeRemaining = Math.ceil(MINUTES_BETWEEN_CLAIMS - timeSinceLastClaim);
+                console.log(`Too soon for new claim. ${timeRemaining} minutes remaining.`);
+                return res.status(400).json({ 
+                    message: `Please wait ${timeRemaining} minutes before claiming again.`,
+                    timeRemaining,
+                    alreadyClaimed: true
+                });
+            }
+        }
+
+        // Generate new code logic
+        const currencyCode = `BLACKJACK-${Math.random().toString(36).substr(2, 8).toUpperCase()}`;
+        console.log(`Generated new currency code for ${email}: ${currencyCode}`);
+
+        // Store in Firestore with timestamp
+        await currencyRef.add({
+            email,
+            code: currencyCode,
+            claimed: false,
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            currencyAmount: 1000,
+            emailSent: false
+        });
+
+        // Send email
         await sendEmail(email, currencyCode);
-        res.json({ message: "Email sent successfully!", code: currencyCode });
+        
+        // Update email status
+        const codeDoc = await currencyRef
+            .where("code", "==", currencyCode)
+            .limit(1)
+            .get();
+            
+        if (!codeDoc.empty) {
+            await codeDoc.docs[0].ref.update({ 
+                emailSent: true,
+                emailSentAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+        }
+
+        res.json({ 
+            message: "Bonus code sent successfully!", 
+            code: currencyCode,
+            nextClaimIn: MINUTES_BETWEEN_CLAIMS
+        });
     } catch (error) {
-        console.error("Error sending email:", error);
-        res.status(500).json({ message: "Failed to send email" });
+        console.error("Error in /api/send-currency-code:", error);
+        res.status(500).json({ 
+            message: "Failed to send bonus code", 
+            error: error.message 
+        });
     }
 });
 
-// Protected route example
-app.get('/api/protected', authenticateToken, (req, res) => {
-    res.json({ message: "This is a protected route", user: req.user });
+// Claim currency code (Once per user)
+app.post('/api/claim-currency-code', authenticateToken, async (req, res) => {
+    const { email } = req.user;
+
+    try {
+        const db = admin.firestore();
+        const currencyRef = db.collection("currency_codes");
+        const usersRef = db.collection("users").doc(email);
+
+        console.log(`Processing claim request for user: ${email}`);
+
+        // Find an unclaimed currency code
+        const snapshot = await currencyRef
+            .where("email", "==", email)
+            .where("claimed", "==", false)
+            .limit(1)
+            .get();
+
+        if (snapshot.empty) {
+            console.log(`No unclaimed codes found for: ${email}`);
+            return res.status(400).json({ message: "No available currency codes or already claimed." });
+        }
+
+        const currencyDoc = snapshot.docs[0];
+        const { code, currencyAmount } = currencyDoc.data();
+
+        // Mark the currency code as claimed
+        await currencyDoc.ref.update({ 
+            claimed: true,
+            claimedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+        console.log(`Marked code ${code} as claimed`);
+
+        // Get current balance and update atomically
+        const userDoc = await usersRef.get();
+        const currentBalance = userDoc.exists ? (userDoc.data().balance || 0) : 0;
+        const newBalance = currentBalance + currencyAmount;
+
+        console.log(`Updating balance: ${currentBalance} + ${currencyAmount} = ${newBalance}`);
+
+        // Update or create user document with new balance
+        await usersRef.set({
+            email,
+            balance: newBalance,
+            lastUpdated: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+
+        console.log(`Successfully updated balance for ${email}`);
+
+        res.json({ 
+            message: "Currency code claimed successfully!", 
+            code, 
+            amountAdded: currencyAmount,
+            previousBalance: currentBalance,
+            newBalance: newBalance
+        });
+    } catch (error) {
+        console.error("Error claiming currency code:", error);
+        console.error("Stack trace:", error.stack);
+        res.status(500).json({ message: "Failed to claim currency code" });
+    }
+});
+
+// Redeem Currency Code Route
+app.post('/api/redeem-currency-code', authenticateToken, async (req, res) => {
+    const { email } = req.user;
+    const { code } = req.body;
+
+    if (!code) {
+        return res.status(400).json({ message: "No code provided" });
+    }
+
+    try {
+        console.log(`Attempting to redeem code ${code} for ${email}`);
+        const currencyRef = admin.firestore().collection("currency_codes");
+        const snapshot = await currencyRef
+            .where("email", "==", email)
+            .where("code", "==", code)
+            .where("claimed", "==", false)
+            .limit(1)
+            .get();
+
+        if (snapshot.empty) {
+            console.log(`Invalid or already claimed code: ${code}`);
+            return res.status(400).json({ message: "Invalid or already claimed code." });
+        }
+
+        const currencyDoc = snapshot.docs[0];
+        await currencyDoc.ref.update({ 
+            claimed: true,
+            claimedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+
+        console.log(`Successfully redeemed code ${code} for ${email}`);
+        res.json({ 
+            message: "Currency code redeemed successfully!", 
+            amount: currencyDoc.data().currencyAmount 
+        });
+    } catch (error) {
+        console.error("Error redeeming currency code:", error);
+        res.status(500).json({ message: "Failed to redeem currency code" });
+    }
+});
+
+// Update Balance Route
+app.post('/api/update-balance', authenticateToken, async (req, res) => {
+    const { email } = req.user;
+    const { balance } = req.body;
+
+    if (typeof balance !== 'number') {
+        return res.status(400).json({ message: "Balance must be a number" });
+    }
+
+    try {
+        const db = admin.firestore();
+        const userRef = db.collection("users").doc(email);
+
+        console.log(`Updating balance for ${email} to ${balance}`);
+
+        // Get current balance for logging
+        const userDoc = await userRef.get();
+        const oldBalance = userDoc.exists ? userDoc.data().balance : 0;
+
+        // Update balance with metadata
+        await userRef.set({
+            balance,
+            email,
+            lastBalanceUpdate: admin.firestore.FieldValue.serverTimestamp(),
+            previousBalance: oldBalance
+        }, { merge: true });
+
+        console.log(`Successfully updated balance for ${email}: ${oldBalance} → ${balance}`);
+        
+        res.json({ 
+            message: "Balance updated successfully", 
+            oldBalance,
+            newBalance: balance,
+            email 
+        });
+    } catch (error) {
+        console.error("Error updating balance:", error);
+        console.error("Stack trace:", error.stack);
+        res.status(500).json({ 
+            message: "Failed to update balance", 
+            error: error.message 
+        });
+    }
 });
 
 // Test route to see if server is working
