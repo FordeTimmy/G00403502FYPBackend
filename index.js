@@ -155,56 +155,49 @@ app.post('/api/protected', async (req, res) => {
     }
 });
 
-// Currency Code Email Route (Sends bonus every X minutes)
+// Currency Code Email Route (Sends daily bonus)
 app.post('/api/send-currency-code', authenticateToken, async (req, res) => {
     const { email } = req.user;
-    const MINUTES_BETWEEN_CLAIMS = 5; // Adjust this value as needed
+    const today = new Date().toISOString().split("T")[0]; // YYYY-MM-DD
 
     try {
-        console.log(`Checking last claim time for ${email}...`);
+        console.log(`Checking if ${email} already claimed today's reward...`);
+
         const currencyRef = admin.firestore().collection("currency_codes");
-        
-        // Get most recent code for this user
         const snapshot = await currencyRef
             .where("email", "==", email)
-            .orderBy("createdAt", "desc")
-            .limit(1)
+            .where("date", "==", today)
             .get();
 
         if (!snapshot.empty) {
-            const lastClaim = snapshot.docs[0].data().createdAt;
-            const timeSinceLastClaim = (Date.now() - lastClaim.toMillis()) / (1 * 60 * 1000 // = 60000 milliseconds (1 minute)
-            ); // Convert to minutes
-
-            if (timeSinceLastClaim < MINUTES_BETWEEN_CLAIMS) {
-                const timeRemaining = Math.ceil(MINUTES_BETWEEN_CLAIMS - timeSinceLastClaim);
-                console.log(`Too soon for new claim. ${timeRemaining} minutes remaining.`);
-                return res.status(400).json({ 
-                    message: `Please wait ${timeRemaining} minutes before claiming again.`,
-                    timeRemaining,
-                    alreadyClaimed: true
-                });
-            }
+            const existingCode = snapshot.docs[0].data().code;
+            console.log(`User ${email} has already claimed today's reward: ${existingCode}`);
+            return res.status(400).json({ 
+                message: "You have already received your daily bonus!",
+                code: existingCode,
+                alreadyReceived: true
+            });
         }
 
-        // Generate new code logic
+        // Generate a new currency code
         const currencyCode = `BLACKJACK-${Math.random().toString(36).substr(2, 8).toUpperCase()}`;
-        console.log(`Generated new currency code for ${email}: ${currencyCode}`);
+        console.log(`Generated currency code for ${email}: ${currencyCode}`);
 
-        // Store in Firestore with timestamp
+        // Store in Firestore with additional metadata
         await currencyRef.add({
             email,
             code: currencyCode,
             claimed: false,
-            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            date: today,
             currencyAmount: 1000,
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
             emailSent: false
         });
 
-        // Send email
+        // Send Email
         await sendEmail(email, currencyCode);
         
-        // Update email status
+        // Update emailSent status
         const codeDoc = await currencyRef
             .where("code", "==", currencyCode)
             .limit(1)
@@ -217,15 +210,17 @@ app.post('/api/send-currency-code', authenticateToken, async (req, res) => {
             });
         }
 
+        console.log(`Email sent to: ${email}`);
+
         res.json({ 
-            message: "Bonus code sent successfully!", 
+            message: "Daily bonus sent successfully!", 
             code: currencyCode,
-            nextClaimIn: MINUTES_BETWEEN_CLAIMS
+            alreadyReceived: false
         });
     } catch (error) {
         console.error("Error in /api/send-currency-code:", error);
         res.status(500).json({ 
-            message: "Failed to send bonus code", 
+            message: "Failed to send daily bonus", 
             error: error.message 
         });
     }
