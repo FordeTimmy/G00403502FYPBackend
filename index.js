@@ -12,7 +12,7 @@ try {
         credential: admin.credential.cert(serviceAccount),
         databaseURL: "https://blackjack-7de19.firebaseio.com"
     });
-    console.log("✅ Firebase Admin SDK initialized successfully!");
+    console.log("Firebase Admin SDK initialized successfully!");
 
     // Test Firestore connection only
     (async () => {
@@ -22,14 +22,14 @@ try {
                 testField: "Hello, Firestore!",
                 timestamp: admin.firestore.FieldValue.serverTimestamp(),
             });
-            console.log("✅ Firestore write test successful!");
+            console.log(" Firestore write test successful!");
         } catch (error) {
-            console.error("❌ Firestore write test failed:", error);
+            console.error(" Firestore write test failed:", error);
             process.exit(1);
         }
     })();
 } catch (error) {
-    console.error("❌ Firebase Admin SDK initialization failed:", error);
+    console.error(" Firebase Admin SDK initialization failed:", error);
     process.exit(1);
 }
 
@@ -42,26 +42,40 @@ const transporter = nodemailer.createTransport({
     }
 });
 
-// Function to send an email - kept for actual currency code sends
-const sendEmail = async (to, currencyCode) => {
+// Updated email sending function with better error handling
+const sendEmail = async (to, currencyCode, isWelcomeBonus = false) => {
+    console.log(`Attempting to send ${isWelcomeBonus ? 'welcome' : 'daily'} bonus email to: ${to}`);
+
+    const subject = isWelcomeBonus ? 
+        "Welcome to Blackjack - Here's Your Signup Bonus! 🎰" : 
+        "Your Daily Blackjack Bonus 🎰";
+    
+    const text = isWelcomeBonus ?
+        `Welcome to Blackjack!\n\nHere is your signup bonus code: ${currencyCode}\nUse this code to get 1000 coins to start playing!\n\nYou'll receive your first daily bonus in 24 hours.` :
+        `Here is your daily bonus code: ${currencyCode}\n\nUse this code in the game to get your daily bonus of 1000 coins!`;
+
     const mailOptions = {
         from: `"Blackjack Rewards" <${process.env.EMAIL_USER}>`,
-        to: to,
-        subject: "Your Daily Blackjack Bonus 🎰",
-        text: `Here is your one-time currency code: ${currencyCode}\n\nUse this code in the game to get your daily bonus of 1000 coins!`
+        to,
+        subject,
+        text
     };
 
     try {
-        await transporter.sendMail(mailOptions);
-        console.log(`Currency code ${currencyCode} sent to ${to}`);
+        const info = await transporter.sendMail(mailOptions);
+        console.log(`✅ Email sent successfully to ${to}`);
+        console.log(`📧 MessageId: ${info.messageId}`);
         return true;
     } catch (error) {
-        console.error("Error sending email:", error);
+        console.error(`❌ Error sending email to ${to}:`, error);
+        console.error('Email configuration:', {
+            user: process.env.EMAIL_USER,
+            to: to,
+            subject: subject
+        });
         return false;
     }
 };
-
-// Remove test email send
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -82,6 +96,52 @@ const authenticateToken = (req, res, next) => {
     });
 };
 
+// Helper function to check if user exists
+const checkUserExists = async (email) => {
+    try {
+        const db = admin.firestore();
+        const userDoc = await db.collection("users").doc(email).get();
+        return userDoc.exists;
+    } catch (error) {
+        console.error(`Error checking user existence: ${error}`);
+        return false;
+    }
+};
+
+// Helper function to create or update user
+const createOrUpdateUser = async (email, data = {}) => {
+    try {
+        const db = admin.firestore();
+        const userRef = db.collection("users").doc(email);
+        
+        // Check if user exists
+        const userDoc = await userRef.get();
+        
+        if (!userDoc.exists) {
+            // Create new user with default values
+            await userRef.set({
+                email,
+                balance: 0,
+                createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                lastBonus: null,
+                isNewUser: true,
+                ...data
+            });
+            return true;
+        }
+        
+        // Update existing user if needed
+        if (Object.keys(data).length > 0) {
+            await userRef.update(data);
+        }
+        return false;
+    } catch (error) {
+        console.error(`Error creating/updating user: ${error}`);
+        throw error;
+    }
+};
+
+// Updated login route with enhanced debugging
 app.post('/api/login', async (req, res) => {
     const { firebaseToken } = req.body;
 
@@ -92,45 +152,182 @@ app.post('/api/login', async (req, res) => {
     try {
         // Verify Firebase Token
         const decodedToken = await admin.auth().verifyIdToken(firebaseToken);
-        console.log("Decoded Firebase Token:", decodedToken);
-
-        // Extract email from the decoded token
         const email = decodedToken.email;
+        console.log(`\n🔐 Login attempt for: ${email}`);
 
-        // Generate a JWT for your backend
+        // Check Firestore for existing user
+        console.log(`🔍 Checking user existence in Firestore for: ${email}`);
+        const db = admin.firestore();
+        const userRef = db.collection("users").doc(email);
+        const userDoc = await userRef.get();
+
+        // Check if user exists
+        const isNewUser = !userDoc.exists;
+        console.log(`👤 User exists in Firestore: ${!isNewUser ? 'Yes ✅' : 'No ❌'}`);
+
+        // Generate JWT
         const token = jwt.sign({ email }, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRES_IN });
+        console.log(`🎫 JWT generated for: ${email}`);
 
-        res.json({ message: "Login successful!", token });
+        if (isNewUser) {
+            console.log(`\n🎉 Processing new user registration: ${email}`);
+
+            try {
+                // Generate welcome code
+                const welcomeCode = `WELCOME-${Math.random().toString(36).substr(2, 8).toUpperCase()}`;
+                console.log(`🔑 Generated welcome code: ${welcomeCode}`);
+
+                // Create user document in Firestore
+                await userRef.set({
+                    email,
+                    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                    balance: 0,
+                    lastBonus: null,
+                    isNewUser: true,
+                    welcomeEmailSent: false
+                });
+                console.log(`✅ User document created for: ${email}`);
+
+                // Store welcome bonus code
+                await db.collection("currency_codes").add({
+                    email,
+                    code: welcomeCode,
+                    claimed: false,
+                    currencyAmount: 1000,
+                    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                    type: 'welcome_bonus'
+                });
+                console.log(`💰 Welcome bonus code stored: ${welcomeCode}`);
+
+                // Send welcome email
+                console.log(`\n📧 Attempting to send welcome email to: ${email}`);
+                const emailSent = await sendEmail(email, welcomeCode, true);
+                console.log(`📨 Email sent status: ${emailSent ? '✅ Success' : '❌ Failed'}`);
+
+                // Update email status in user document
+                await userRef.update({
+                    welcomeEmailSent: emailSent,
+                    welcomeEmailAttemptedAt: admin.firestore.FieldValue.serverTimestamp()
+                });
+
+                if (!emailSent) {
+                    console.error(`\n❌ Welcome email failed for ${email}`);
+                    console.error('Email Configuration:', {
+                        user: process.env.EMAIL_USER,
+                        recipient: email,
+                        code: welcomeCode
+                    });
+                }
+
+                console.log(`\n✨ New user setup completed for: ${email}`);
+                return res.json({
+                    message: "Welcome to Blackjack!",
+                    token,
+                    welcomeCode,
+                    isNewUser: true,
+                    emailSent
+                });
+            } catch (error) {
+                console.error(`\n❌ Error creating new user ${email}:`, error);
+                throw error;
+            }
+        }
+
+        console.log(`\n👋 Returning user logged in: ${email}`);
+        res.json({
+            message: "Login successful!",
+            token,
+            isNewUser: false
+        });
     } catch (error) {
-        console.error("Error verifying Firebase token:", error);
-        res.status(403).json({ message: "Invalid Firebase token" });
+        console.error("\n❌ Login error:", error);
+        res.status(403).json({
+            message: "Login failed",
+            error: error.message,
+            stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+        });
     }
 });
 
-// Token Verification Route
+// Updated verify-token route with welcome email handling
 app.post('/api/verify-token', async (req, res) => {
-    console.log("Received request body:", req.body);
-
     const { firebaseToken } = req.body;
 
     if (!firebaseToken) {
-        console.log("No token provided in request");
         return res.status(400).json({ message: "No token provided" });
     }
 
     try {
-        // Verify Firebase ID Token
         const decodedToken = await admin.auth().verifyIdToken(firebaseToken);
-        console.log("Decoded Firebase Token:", decodedToken);
+        const email = decodedToken.email;
+        console.log(`Processing token verification for: ${email}`);
 
-        // Generate a JWT for your backend
-        const token = jwt.sign({ email: decodedToken.email }, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRES_IN });
+        // Check if user exists
+        const db = admin.firestore();
+        const userRef = db.collection("users").doc(email);
+        const userDoc = await userRef.get();
 
-        console.log("JWT generated successfully");
-        res.json({ message: "Token verified successfully!", token });
+        // Generate JWT
+        const token = jwt.sign({ email }, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRES_IN });
+
+        if (!userDoc.exists) {
+            console.log(`New user detected during verification: ${email}`);
+            try {
+                // Generate welcome bonus code
+                const welcomeCode = `WELCOME-${Math.random().toString(36).substr(2, 8).toUpperCase()}`;
+                console.log(`Generated welcome code: ${welcomeCode}`);
+
+                // Create new user document
+                await userRef.set({
+                    email,
+                    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                    balance: 0,
+                    lastBonus: null,
+                    isNewUser: true
+                });
+                console.log(`Created user document for: ${email}`);
+
+                // Store welcome bonus code
+                await db.collection("currency_codes").add({
+                    email,
+                    code: welcomeCode,
+                    claimed: false,
+                    currencyAmount: 1000,
+                    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                    type: 'welcome_bonus'
+                });
+                console.log(`Stored welcome bonus code: ${welcomeCode}`);
+
+                // Send welcome email
+                const emailSent = await sendEmail(email, welcomeCode, true);
+                console.log(`Welcome email sent status: ${emailSent ? 'Success' : 'Failed'}`);
+
+                return res.json({
+                    message: "Token verified successfully!",
+                    token,
+                    isNewUser: true,
+                    welcomeCode,
+                    emailSent
+                });
+            } catch (error) {
+                console.error(`Error processing new user: ${error}`);
+                throw error;
+            }
+        }
+
+        console.log(`Existing user verified: ${email}`);
+        res.json({
+            message: "Token verified successfully!",
+            token,
+            isNewUser: false
+        });
     } catch (error) {
-        console.error("Error verifying Firebase token:", error);
-        res.status(403).json({ message: "Invalid Firebase token", error: error.message });
+        console.error("Error verifying token:", error);
+        res.status(403).json({
+            message: "Invalid token",
+            error: error.message,
+            stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+        });
     }
 });
 
@@ -155,70 +352,65 @@ app.post('/api/protected', async (req, res) => {
     }
 });
 
-// Currency Code Email Route (Sends daily bonus)
+// Update daily bonus route to enforce 24-hour wait
 app.post('/api/send-currency-code', authenticateToken, async (req, res) => {
     const { email } = req.user;
-    const today = new Date().toISOString().split("T")[0]; // YYYY-MM-DD
 
     try {
-        console.log(`Checking if ${email} already claimed today's reward...`);
+        const db = admin.firestore();
+        const userRef = db.collection("users").doc(email);
+        const userDoc = await userRef.get();
 
-        const currencyRef = admin.firestore().collection("currency_codes");
-        const snapshot = await currencyRef
-            .where("email", "==", email)
-            .where("date", "==", today)
-            .get();
-
-        if (!snapshot.empty) {
-            const existingCode = snapshot.docs[0].data().code;
-            console.log(`User ${email} has already claimed today's reward: ${existingCode}`);
-            return res.status(400).json({ 
-                message: "You have already received your daily bonus!",
-                code: existingCode,
-                alreadyReceived: true
+        // Create user if they don't exist
+        if (!userDoc.exists) {
+            console.log(`Creating user document for: ${email}`);
+            await userRef.set({
+                email,
+                createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                balance: 0,
+                lastBonus: null
             });
         }
 
-        // Generate a new currency code
-        const currencyCode = `BLACKJACK-${Math.random().toString(36).substr(2, 8).toUpperCase()}`;
-        console.log(`Generated currency code for ${email}: ${currencyCode}`);
+        // Continue with existing bonus logic
+        const lastBonus = userDoc.exists ? userDoc.data().lastBonus?.toDate() || new Date(0) : new Date(0);
+        const hoursSinceLastBonus = (new Date() - lastBonus) / (1000 * 60 * 60);
 
-        // Store in Firestore with additional metadata
-        await currencyRef.add({
+        if (hoursSinceLastBonus < 24) {
+            const hoursRemaining = Math.ceil(24 - hoursSinceLastBonus);
+            return res.status(400).json({ 
+                message: `Please wait ${hoursRemaining} hours before claiming another bonus`,
+                hoursRemaining
+            });
+        }
+
+        // Generate new bonus code
+        const currencyCode = `DAILY-${Math.random().toString(36).substr(2, 8).toUpperCase()}`;
+        
+        // Store in Firestore
+        await db.collection("currency_codes").add({
             email,
             code: currencyCode,
             claimed: false,
-            date: today,
             currencyAmount: 1000,
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
-            emailSent: false
+            type: 'daily_bonus'
         });
 
-        // Send Email
-        await sendEmail(email, currencyCode);
-        
-        // Update emailSent status
-        const codeDoc = await currencyRef
-            .where("code", "==", currencyCode)
-            .limit(1)
-            .get();
-            
-        if (!codeDoc.empty) {
-            await codeDoc.docs[0].ref.update({ 
-                emailSent: true,
-                emailSentAt: admin.firestore.FieldValue.serverTimestamp()
-            });
-        }
+        // Update last bonus time
+        await userRef.update({
+            lastBonus: admin.firestore.FieldValue.serverTimestamp()
+        });
 
-        console.log(`Email sent to: ${email}`);
+        // Send email
+        await sendEmail(email, currencyCode, false);
 
         res.json({ 
             message: "Daily bonus sent successfully!", 
-            code: currencyCode,
-            alreadyReceived: false
+            code: currencyCode
         });
     } catch (error) {
-        console.error("Error in /api/send-currency-code:", error);
+        console.error("Error sending daily bonus:", error);
         res.status(500).json({ 
             message: "Failed to send daily bonus", 
             error: error.message 
@@ -340,34 +532,18 @@ app.post('/api/update-balance', authenticateToken, async (req, res) => {
     }
 
     try {
-        const db = admin.firestore();
-        const userRef = db.collection("users").doc(email);
-
-        console.log(`Updating balance for ${email} to ${balance}`);
-
-        // Get current balance for logging
-        const userDoc = await userRef.get();
-        const oldBalance = userDoc.exists ? userDoc.data().balance : 0;
-
-        // Update balance with metadata
-        await userRef.set({
+        await createOrUpdateUser(email, { 
             balance,
-            email,
-            lastBalanceUpdate: admin.firestore.FieldValue.serverTimestamp(),
-            previousBalance: oldBalance
-        }, { merge: true });
+            lastBalanceUpdate: admin.firestore.FieldValue.serverTimestamp()
+        });
 
-        console.log(`Successfully updated balance for ${email}: ${oldBalance} → ${balance}`);
-        
         res.json({ 
             message: "Balance updated successfully", 
-            oldBalance,
             newBalance: balance,
             email 
         });
     } catch (error) {
         console.error("Error updating balance:", error);
-        console.error("Stack trace:", error.stack);
         res.status(500).json({ 
             message: "Failed to update balance", 
             error: error.message 
