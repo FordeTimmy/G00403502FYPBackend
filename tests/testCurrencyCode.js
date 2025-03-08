@@ -17,12 +17,12 @@ async function testCurrencyCodeAPI() {
         console.log('Response:', data);
 
         if (data.code) {
-            console.log('✅ Success! Currency code generated:', data.code);
+            console.log('Success! Currency code generated:', data.code);
         } else {
-            console.log('❌ Error: No currency code in response');
+            console.log('Error: No currency code in response');
         }
     } catch (error) {
-        console.error('❌ Test failed:', error);
+        console.error('Test failed:', error);
     }
 }
 
