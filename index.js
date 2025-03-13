@@ -12,14 +12,13 @@ require('dotenv').config();
 
 // Initialize Firebase Admin
 try {
-    const serviceAccount = require("./blackjack-7de19-firebase-adminsdk.json");
+    const serviceAccount = require("./blackjack-7de19-firebase-adminsdk-ywetd-6e45e242b3.json");
     admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount),
-        databaseURL: "https://blackjack-7de19.firebaseio.com"
+        credential: admin.credential.cert(serviceAccount)
     });
     console.log("Firebase Admin SDK initialized successfully!");
 
-    // Test Firestore connection only
+    // Test Firestore connection
     (async () => {
         try {
             const testRef = admin.firestore().collection("test_collection");
@@ -27,14 +26,14 @@ try {
                 testField: "Hello, Firestore!",
                 timestamp: admin.firestore.FieldValue.serverTimestamp(),
             });
-            console.log(" Firestore write test successful!");
+            console.log("Firestore write test successful!");
         } catch (error) {
-            console.error(" Firestore write test failed:", error);
+            console.error("Firestore write test failed:", error);
             process.exit(1);
         }
     })();
 } catch (error) {
-    console.error(" Firebase Admin SDK initialization failed:", error);
+    console.error("Firebase Admin SDK initialization failed:", error);
     process.exit(1);
 }
 
