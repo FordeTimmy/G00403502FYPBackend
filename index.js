@@ -10,6 +10,10 @@ const speakeasy = require("speakeasy");
 const qrcode = require("qrcode");
 require('dotenv').config();
 
+// Add these constants near the top of your file
+const MAX_RETRIES = 3;
+const VERIFY_TIMEOUT = 5000;
+
 // Initialize Firebase Admin
 try {
     // Use environment variables instead of JSON file
@@ -101,16 +105,37 @@ const PORT = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json());
 
-// Basic JWT authentication without 2FA check
-const authenticateTokenSkip2FA = (req, res, next) => {
-    const token = req.headers['authorization']?.split(' ')[1];
-    if (!token) return res.sendStatus(403);
+// Update authenticateTokenSkip2FA middleware
+const authenticateTokenSkip2FA = async (req, res, next) => {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    
+    if (!token) {
+        return res.status(401).json({ message: "Authorization token required" });
+    }
 
-    jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
-        if (err) return res.sendStatus(403);
-        req.user = user;
-        next();
-    });
+    try {
+        // First try verifying as Firebase token
+        const decoded = await admin.auth().verifyIdToken(token);
+        req.user = {
+            email: decoded.email,
+            uid: decoded.uid
+        };
+        return next();
+    } catch (firebaseError) {
+        // If Firebase verification fails, try as JWT
+        try {
+            const decoded = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] });
+            req.user = {
+                email: decoded.email,
+                uid: decoded.uid
+            };
+            return next();
+        } catch (jwtError) {
+            console.error("Token verification failed:", jwtError);
+            return res.status(403).json({ message: "Invalid token" });
+        }
+    }
 };
 
 // JWT authentication with 2FA enforcement
@@ -122,7 +147,9 @@ const authenticateTokenWith2FA = (req, res, next) => {
         if (err) return res.sendStatus(403);
 
         if (!user.twoFAVerified) {
-            return res.status(403).json({ message: "2FA verification required" });
+            return res.status(403).json({ 
+                message: "2FA verification required" 
+            });
         }
 
         req.user = user;
@@ -130,12 +157,16 @@ const authenticateTokenWith2FA = (req, res, next) => {
     });
 };
 
-// Add utility function for token generation
-const generateToken = (email, verified = false, temporary = false) => {
+// Update your token generation to explicitly specify algorithm
+// In your backend
+const generateToken = (email, uid, verified = false) => {
     return jwt.sign(
-        { email, twoFAVerified: verified },
+        { email, uid, twoFAVerified: verified },
         process.env.JWT_SECRET,
-        { expiresIn: temporary ? '5m' : process.env.JWT_EXPIRES_IN }
+        { 
+            expiresIn: process.env.JWT_EXPIRES_IN || '1h',
+            algorithm: 'HS256' // Explicitly set
+        }
     );
 };
 
@@ -186,220 +217,161 @@ const createOrUpdateUser = async (email, data = {}) => {
 
 // Updated login route with enhanced debugging
 app.post('/api/login', async (req, res) => {
-    const { firebaseToken } = req.body;
+    const { firebaseToken, email } = req.body;
 
     if (!firebaseToken) {
         return res.status(400).json({ message: "No token provided" });
     }
 
     try {
-        // Verify Firebase Token
         const decodedToken = await admin.auth().verifyIdToken(firebaseToken);
-        const email = decodedToken.email;
+        const { email, uid } = decodedToken;
         console.log(`\nLogin attempt for: ${email}`);
 
-        // Check Firestore for existing user
-        console.log(`Checking user existence in Firestore for: ${email}`);
         const db = admin.firestore();
-        const userRef = db.collection("users").doc(email);
-        const userDoc = await userRef.get();
+        const userDoc = await db.collection("users").doc(email).get();
 
-        // Check if user exists
-        const isNewUser = !userDoc.exists;
-        console.log(`User exists in Firestore: ${!isNewUser ? 'Yes ' : 'No '}`);
-
-        // Generate JWT
-        const token = generateToken(email, true);
-        console.log(`JWT generated for: ${email}`);
-
-        if (userDoc.exists) {
-            const userData = userDoc.data();
-            if (userData.twoFactorEnabled) {
-                return res.json({
-                    message: "2FA required",
-                    twoFactorRequired: true,
-                    token // Temporary token for 2FA verification
-                });
-            }
+        // Check if user has 2FA enabled
+        if (userDoc.exists && userDoc.data().twoFactorEnabled) {
+            const tempToken = generateToken(email, uid, false);
+            return res.json({
+                success: true,
+                requires2FA: true,
+                tempToken,
+                message: "2FA verification required"
+            });
         }
 
-        if (userDoc.exists) {
-            const userData = userDoc.data();
-            if (userData.twoFactorEnabled) {
-                return res.json({
-                    message: "2FA required",
-                    twoFactorRequired: true,
-                    token // Temporary token
-                });
-            }
-        }
-
-        if (isNewUser) {
-            console.log(`\nProcessing new user registration: ${email}`);
-
-            try {
-                // Generate welcome code
-                const welcomeCode = `WELCOME-${Math.random().toString(36).substr(2, 8).toUpperCase()}`;
-                console.log(`Generated welcome code: ${welcomeCode}`);
-
-                // Create user document in Firestore
-                await userRef.set({
-                    email,
-                    createdAt: admin.firestore.FieldValue.serverTimestamp(),
-                    balance: 0,
-                    lastBonus: null,
-                    isNewUser: true,
-                    welcomeEmailSent: false
-                });
-                console.log(`User document created for: ${email}`);
-
-                // Store welcome bonus code
-                await db.collection("currency_codes").add({
-                    email,
-                    code: welcomeCode,
-                    claimed: false,
-                    currencyAmount: 1000,
-                    createdAt: admin.firestore.FieldValue.serverTimestamp(),
-                    type: 'welcome_bonus'
-                });
-                console.log(`Welcome bonus code stored: ${welcomeCode}`);
-
-                // Send welcome email
-                console.log(`\nAttempting to send welcome email to: ${email}`);
-                const emailSent = await sendEmail(email, welcomeCode, true);
-                console.log(`Email sent status: ${emailSent ? ' Success' : 'Failed'}`);
-
-                // Update email status in user document
-                await userRef.update({
-                    welcomeEmailSent: emailSent,
-                    welcomeEmailAttemptedAt: admin.firestore.FieldValue.serverTimestamp()
-                });
-
-                if (!emailSent) {
-                    console.error(`\nWelcome email failed for ${email}`);
-                    console.error('Email Configuration:', {
-                        user: process.env.EMAIL_USER,
-                        recipient: email,
-                        code: welcomeCode
-                    });
-                }
-
-                console.log(`\nNew user setup completed for: ${email}`);
-                return res.json({
-                    message: "Welcome to Blackjack!",
-                    token,
-                    welcomeCode,
-                    isNewUser: true,
-                    emailSent
-                });
-            } catch (error) {
-                console.error(`\nError creating new user ${email}:`, error);
-                throw error;
-            }
-        }
-
-        console.log(`\nReturning user logged in: ${email}`);
-        res.json({
-            message: "Login successful!",
-            token,
-            isNewUser: false
-        });
+        // No 2FA required - generate full access token
+        const token = generateToken(email, uid, true);
+        
+        // Rest of your existing login logic for new/returning users
+        // ...existing code...
     } catch (error) {
         console.error("\nLogin error:", error);
         res.status(403).json({
+            success: false,
             message: "Login failed",
-            error: error.message,
-            stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+            error: error.message
         });
     }
 });
 
-// Updated verify-token route with welcome email handling
-app.post('/api/verify-token', async (req, res) => {
-    const { firebaseToken } = req.body;
+// Update verifyToken helper function
+const verifyTokenWithRetry = async (token, retryCount = 0) => {
+    try {
+        return await Promise.race([
+            admin.auth().verifyIdToken(token),
+            new Promise((_, reject) => 
+                setTimeout(() => reject(new Error("Verification timeout")), VERIFY_TIMEOUT)
+            )
+        ]);
+    } catch (error) {
+        if (retryCount >= MAX_RETRIES) {
+            throw new Error(`Max retries (${MAX_RETRIES}) reached: ${error.message}`);
+        }
+        console.log(`Retry attempt ${retryCount + 1}/${MAX_RETRIES}`);
+        return verifyTokenWithRetry(token, retryCount + 1);
+    }
+};
 
-    if (!firebaseToken) {
-        return res.status(400).json({ message: "No token provided" });
+// Update verify-token endpoint to only handle verification
+app.post('/api/verify-token', async (req, res) => {
+    const { firebaseToken, email } = req.body;
+
+    if (!firebaseToken || !email) {
+        return res.status(400).json({
+            success: false,
+            message: "Firebase token and email are required"
+        });
     }
 
     try {
-        const decodedToken = await admin.auth().verifyIdToken(firebaseToken);
-        const email = decodedToken.email;
-        console.log(`Processing token verification for: ${email}`);
+        // Verify Firebase token
+        const decodedToken = await verifyTokenWithRetry(firebaseToken);
+        
+        // Verify email matches token
+        if (decodedToken.email !== email) {
+            return res.status(403).json({
+                success: false,
+                message: "Token email mismatch"
+            });
+        }
 
-        // Check if user exists
-        const db = admin.firestore();
-        const userRef = db.collection("users").doc(email);
-        const userDoc = await userRef.get();
+        // Simple user existence check
+        const userDoc = await admin.firestore()
+            .collection("users")
+            .doc(email)
+            .get();
 
         if (!userDoc.exists) {
-            // Handle new user registration
-            const welcomeCode = `WELCOME-${Math.random().toString(36).substr(2, 8).toUpperCase()}`;
-            await userRef.set({
-                email,
-                createdAt: admin.firestore.FieldValue.serverTimestamp(),
-                balance: 0,
-                lastBonus: null,
-                isNewUser: true,
-                twoFactorEnabled: false
-            });
-
-            const token = generateToken(email, true);
-            return res.json({
-                message: "New user registered",
-                token,
-                isNewUser: true,
-                welcomeCode
+            return res.status(404).json({
+                success: false,
+                message: "User not found"
             });
         }
 
-        const userData = userDoc.data();
-
-        // Check if 2FA is enabled
-        if (userData.twoFactorEnabled) {
-            console.log(`User ${email} requires 2FA verification`);
-            const tempToken = generateToken(email, false, true);
-            return res.json({
-                message: "2FA verification required",
-                twoFactorRequired: true,
-                token: tempToken
-            });
-        }
-
-        // No 2FA required, issue full token
-        const token = generateToken(email, true);
-        res.json({
-            message: "Login successful",
-            token,
-            twoFactorRequired: false
+        // Return simple verification success
+        return res.json({
+            success: true,
+            email: decodedToken.email,
+            verified: true
         });
 
     } catch (error) {
         console.error("Token verification failed:", error);
-        res.status(403).json({ message: "Invalid token" });
+        return res.status(403).json({
+            success: false,
+            message: "Token verification failed",
+            error: process.env.NODE_ENV === 'development' ? error.message : undefined
+        });
     }
 });
 
-// Firebase Protected route
-app.post('/api/protected', async (req, res) => {
-    const token = req.headers.authorization?.split(' ')[1];
-
-    if (!token) {
-        return res.status(401).json({ message: 'Unauthorized: No token provided' });
-    }
-
+const handleLogin = async (e) => {
+    e.preventDefault();
+    setError('');
+    
     try {
-        // Verify the token using Firebase Admin SDK
-        const decodedToken = await admin.auth().verifyIdToken(token);
-        console.log('Decoded Token:', decodedToken);
+        // 1. Firebase auth
+        const userCredential = await signInWithEmailAndPassword(auth, email, password);
+        const user = userCredential.user;
+        
+        // 2. Get fresh Firebase token (THIS IS CRUCIAL)
+        const firebaseToken = await user.getIdToken(true);
+        
+        // 3. Verify with backend
+        const response = await fetch("http://localhost:5000/api/verify-token", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ 
+                firebaseToken, // Send the actual Firebase token
+                email: user.email 
+            })
+        });
 
-        // Continue with your protected logic
-        res.json({ message: 'Protected route accessed', user: decodedToken });
+        const data = await response.json();
+
+        if (!response.ok) {
+            throw new Error(data.message || "Verification failed");
+        }
+
+        // 4. Handle 2FA requirement
+        if (data.requires2FA) {
+            setTwoFARequired(true);
+            setTempToken(data.tempToken);
+            return;
+        }
+        
+        // 5. No 2FA required
+        localStorage.setItem("token", data.token);
+        navigate('/profile');
+        
     } catch (error) {
-        console.error('Error verifying token:', error);
-        res.status(403).json({ message: 'Forbidden: Invalid token' });
+        setError(error.message || "Login failed");
+        console.error("Login error:", error);
     }
-});
+};
 
 // Core daily bonus function
 const manuallyTriggerDailyBonus = async () => {
@@ -664,7 +636,6 @@ app.post('/api/claim-currency-code', authenticateTokenWith2FA, async (req, res) 
             .get();
 
         if (snapshot.empty) {
-            console.log(`No unclaimed codes found for: ${email}`);
             return res.status(400).json({ message: "No available currency codes or already claimed." });
         }
 
@@ -778,112 +749,150 @@ app.post('/api/update-balance', authenticateTokenWith2FA, async (req, res) => {
     }
 });
 
-// Add 2FA setup route with simplified QR code generation
-app.post('/api/setup-2fa', authenticateTokenSkip2FA, async (req, res) => {
-    const { email } = req.user;
-    try {
-        console.log(`🔹 Setting up 2FA for: ${email}`);
-        
-        // Generate secret with proper parameters
-        const secret = speakeasy.generateSecret({
-            length: 20,
-            issuer: 'Blackjack Game',
-            name: email
+// Update 2FA verification route with better naming
+app.post('/api/verify-2fa', async (req, res) => {
+    const { email, token, tempToken } = req.body;
+    
+    if (!email || !token || !tempToken) {
+        return res.status(400).json({ 
+            success: false,
+            message: "Missing required fields" 
         });
+    }
 
+    try {
+        // First verify the temporary token
+        let decodedTemp;
         try {
-            // Use the built-in otpauth_url
-            const qrCode = await qrcode.toDataURL(secret.otpauth_url, {
-                errorCorrectionLevel: 'L',
-                type: 'image/png',
-                width: 200,
-                margin: 1
-            });
-
-            const db = admin.firestore();
-            await db.collection("users").doc(email).update({
-                twoFactorSecret: secret.base32,
-                twoFactorEnabled: true,
-                twoFactorSetupDate: admin.firestore.FieldValue.serverTimestamp(),
-                // Remove old fields if they exist
-                twoFASecret: admin.firestore.FieldValue.delete(),
-                twoFAEnabled: admin.firestore.FieldValue.delete(),
-                twoFASetupDate: admin.firestore.FieldValue.delete()
-            });
-
-            console.log(`✅ 2FA setup complete for ${email}`);
-            res.json({
-                success: true,
-                qrCode,
-                secret: secret.base32
-            });
-        } catch (qrError) {
-            console.error("❌ QR Code generation failed:", qrError);
-            res.status(500).json({ 
+            decodedTemp = jwt.verify(tempToken, process.env.JWT_SECRET);
+            if (decodedTemp.email !== email) {
+                throw new Error("Token email mismatch");
+            }
+        } catch (error) {
+            return res.status(403).json({
                 success: false,
-                message: "Failed to generate QR code" 
+                message: "Invalid temporary token"
             });
         }
-    } catch (error) {
-        console.error('❌ 2FA Setup Error:', error);
-        res.status(500).json({
-            success: false,
-            error: error.message,
-            message: 'Failed to setup 2FA'
-        });
-    }
-});
 
-// Update 2FA verification route with better naming
-app.post('/api/verify-2fa', authenticateTokenSkip2FA, async (req, res) => {
-    const { email } = req.user;
-    const { token } = req.body;
-
-    if (!token) {
-        return res.status(400).json({ message: "Missing 2FA token" });
-    }
-
-    try {
         const db = admin.firestore();
         const userDoc = await db.collection("users").doc(email).get();
-
+        
         if (!userDoc.exists) {
-            return res.status(404).json({ message: "User not found" });
+            return res.status(404).json({
+                success: false,
+                message: "User not found"
+            });
         }
 
         const userData = userDoc.data();
-        const secret = userData.twoFactorSecret;
-
-        if (!userData.twoFactorEnabled || !secret) {
-            return res.status(400).json({ message: "2FA not enabled" });
+        if (!userData.twoFactorEnabled || !userData.twoFactorSecret) {
+            return res.status(400).json({
+                success: false,
+                message: "2FA not enabled for this user"
+            });
         }
 
         const verified = speakeasy.totp.verify({
-            secret,
+            secret: userData.twoFactorSecret,
             encoding: 'base32',
             token,
             window: 1
         });
 
         if (!verified) {
-            return res.status(400).json({ message: "Invalid 2FA code" });
+            return res.status(400).json({
+                success: false,
+                message: "Invalid 2FA code"
+            });
         }
 
-        // Issue final JWT with 2FA verification
-        const authToken = jwt.sign(
-            { email, twoFAVerified: true },
-            process.env.JWT_SECRET,
-            { expiresIn: process.env.JWT_EXPIRES_IN }
-        );
+        // Issue final access token
+        const finalToken = generateToken(email, decodedTemp.uid, true);
+
+        // Log successful 2FA verification
+        console.log(`2FA verified successfully for ${email}`);
 
         res.json({
+            success: true,
             message: "2FA verified successfully",
-            token: authToken
+            token: finalToken
         });
 
     } catch (error) {
         console.error("2FA verification error:", error);
-        res.status(500).json({ message: "Failed to verify 2FA" });
+        res.status(500).json({
+            success: false,
+            message: "Failed to verify 2FA",
+            error: error.message
+        });
+    }
+});
+
+app.post('/api/setup-2fa', authenticateTokenSkip2FA, async (req, res) => {
+    try {
+        const { email } = req.user;
+        
+        if (!email) {
+            return res.status(400).json({
+                success: false,
+                message: "User email is required"
+            });
+        }
+
+        const db = admin.firestore();
+        const userRef = db.collection("users").doc(email);
+
+        const userDoc = await userRef.get();
+        if (!userDoc.exists) {
+            return res.status(404).json({
+                success: false,
+                message: "User not found"
+            });
+        }
+
+        // Check if 2FA already enabled
+        const userData = userDoc.data();
+        if (userData.twoFactorEnabled) {
+            return res.json({
+                success: true,
+                alreadyEnabled: true,
+                message: "2FA already enabled"
+            });
+        }
+
+        // Generate new secret
+        const secret = speakeasy.generateSecret({
+            length: 20,
+            name: email,
+            issuer: "Blackjack Game"
+        });
+
+        // Generate QR code but don't store it
+        const qrCode = await qrcode.toDataURL(secret.otpauth_url);
+
+        // Only store the necessary secret
+        await userRef.update({
+            twoFactorEnabled: true,
+            twoFactorSecret: secret.base32, // Only store the base32 secret
+            twoFactorSetupDate: admin.firestore.FieldValue.serverTimestamp()
+        });
+
+        // Send both secret and QR code to frontend
+        return res.json({
+            success: true,
+            qrCode, // Send QR code for initial setup only
+            secret: secret.base32,
+            message: "2FA setup successful"
+        });
+
+    } catch (error) {
+        console.error('2FA Setup Error:', error);
+        return res.status(500).json({
+            success: false,
+            message: "Failed to setup 2FA",
+            error: error.message
+        });
     }
 });
 
