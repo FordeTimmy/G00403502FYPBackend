@@ -6,8 +6,6 @@ const jwt = require('jsonwebtoken');
 const admin = require("firebase-admin");
 const nodemailer = require("nodemailer");
 const cron = require('node-cron');
-const speakeasy = require("speakeasy");
-const qrcode = require("qrcode");
 require('dotenv').config();
 
 // Add these constants near the top of your file
@@ -105,8 +103,8 @@ const PORT = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json());
 
-// Update authenticateTokenSkip2FA middleware
-const authenticateTokenSkip2FA = async (req, res, next) => {
+// Simplified authentication middleware
+const authenticateToken = async (req, res, next) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
     
@@ -138,30 +136,11 @@ const authenticateTokenSkip2FA = async (req, res, next) => {
     }
 };
 
-// JWT authentication with 2FA enforcement
-const authenticateTokenWith2FA = (req, res, next) => {
-    const token = req.headers['authorization']?.split(' ')[1];
-    if (!token) return res.sendStatus(403);
-
-    jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
-        if (err) return res.sendStatus(403);
-
-        if (!user.twoFAVerified) {
-            return res.status(403).json({ 
-                message: "2FA verification required" 
-            });
-        }
-
-        req.user = user;
-        next();
-    });
-};
-
 // Update your token generation to explicitly specify algorithm
 // In your backend
-const generateToken = (email, uid, verified = false) => {
+const generateToken = (email, uid) => {
     return jwt.sign(
-        { email, uid, twoFAVerified: verified },
+        { email, uid },
         process.env.JWT_SECRET,
         { 
             expiresIn: process.env.JWT_EXPIRES_IN || '1h',
@@ -231,22 +210,12 @@ app.post('/api/login', async (req, res) => {
         const db = admin.firestore();
         const userDoc = await db.collection("users").doc(email).get();
 
-        // Check if user has 2FA enabled
-        if (userDoc.exists && userDoc.data().twoFactorEnabled) {
-            const tempToken = generateToken(email, uid, false);
-            return res.json({
-                success: true,
-                requires2FA: true,
-                tempToken,
-                message: "2FA verification required"
-            });
-        }
-
-        // No 2FA required - generate full access token
-        const token = generateToken(email, uid, true);
-        
-        // Rest of your existing login logic for new/returning users
-        // ...existing code...
+        // Generate token without 2FA verification
+        const token = generateToken(email, uid);
+        res.json({
+            success: true,
+            token
+        });
     } catch (error) {
         console.error("\nLogin error:", error);
         res.status(403).json({
@@ -356,14 +325,7 @@ const handleLogin = async (e) => {
             throw new Error(data.message || "Verification failed");
         }
 
-        // 4. Handle 2FA requirement
-        if (data.requires2FA) {
-            setTwoFARequired(true);
-            setTempToken(data.tempToken);
-            return;
-        }
-        
-        // 5. No 2FA required
+        // 4. No 2FA required
         localStorage.setItem("token", data.token);
         navigate('/profile');
         
@@ -538,7 +500,7 @@ app.post('/api/test-daily-bonus', async (req, res) => {
 });
 
 // Update daily bonus route to enforce 24-hour wait
-app.post('/api/send-currency-code', authenticateTokenWith2FA, async (req, res) => {
+app.post('/api/send-currency-code', authenticateToken, async (req, res) => {
     const { email } = req.user;
 
     try {
@@ -618,7 +580,7 @@ app.post('/api/send-currency-code', authenticateTokenWith2FA, async (req, res) =
 });
 
 // Claim currency code (Once per user)
-app.post('/api/claim-currency-code', authenticateTokenWith2FA, async (req, res) => {
+app.post('/api/claim-currency-code', authenticateToken, async (req, res) => {
     const { email } = req.user;
 
     try {
@@ -680,7 +642,7 @@ app.post('/api/claim-currency-code', authenticateTokenWith2FA, async (req, res) 
 });
 
 // Redeem Currency Code Route
-app.post('/api/redeem-currency-code', authenticateTokenWith2FA, async (req, res) => {
+app.post('/api/redeem-currency-code', authenticateToken, async (req, res) => {
     const { email } = req.user;
     const { code } = req.body;
 
@@ -721,7 +683,7 @@ app.post('/api/redeem-currency-code', authenticateTokenWith2FA, async (req, res)
 });
 
 // Update Balance Route
-app.post('/api/update-balance', authenticateTokenWith2FA, async (req, res) => {
+app.post('/api/update-balance', authenticateToken, async (req, res) => {
     const { email } = req.user;
     const { balance } = req.body;
 
@@ -749,159 +711,16 @@ app.post('/api/update-balance', authenticateTokenWith2FA, async (req, res) => {
     }
 });
 
-// Update 2FA verification route with better naming
-app.post('/api/verify-2fa', async (req, res) => {
-    const { email, token, tempToken } = req.body;
-    
-    if (!email || !token || !tempToken) {
-        return res.status(400).json({ 
-            success: false,
-            message: "Missing required fields" 
-        });
-    }
-
-    try {
-        // First verify the temporary token
-        let decodedTemp;
-        try {
-            decodedTemp = jwt.verify(tempToken, process.env.JWT_SECRET);
-            if (decodedTemp.email !== email) {
-                throw new Error("Token email mismatch");
-            }
-        } catch (error) {
-            return res.status(403).json({
-                success: false,
-                message: "Invalid temporary token"
-            });
-        }
-
-        const db = admin.firestore();
-        const userDoc = await db.collection("users").doc(email).get();
-        
-        if (!userDoc.exists) {
-            return res.status(404).json({
-                success: false,
-                message: "User not found"
-            });
-        }
-
-        const userData = userDoc.data();
-        if (!userData.twoFactorEnabled || !userData.twoFactorSecret) {
-            return res.status(400).json({
-                success: false,
-                message: "2FA not enabled for this user"
-            });
-        }
-
-        const verified = speakeasy.totp.verify({
-            secret: userData.twoFactorSecret,
-            encoding: 'base32',
-            token,
-            window: 1
-        });
-
-        if (!verified) {
-            return res.status(400).json({
-                success: false,
-                message: "Invalid 2FA code"
-            });
-        }
-
-        // Issue final access token
-        const finalToken = generateToken(email, decodedTemp.uid, true);
-
-        // Log successful 2FA verification
-        console.log(`2FA verified successfully for ${email}`);
-
-        res.json({
-            success: true,
-            message: "2FA verified successfully",
-            token: finalToken
-        });
-
-    } catch (error) {
-        console.error("2FA verification error:", error);
-        res.status(500).json({
-            success: false,
-            message: "Failed to verify 2FA",
-            error: error.message
-        });
-    }
-});
-
-app.post('/api/setup-2fa', authenticateTokenSkip2FA, async (req, res) => {
-    try {
-        const { email } = req.user;
-        
-        if (!email) {
-            return res.status(400).json({
-                success: false,
-                message: "User email is required"
-            });
-        }
-
-        const db = admin.firestore();
-        const userRef = db.collection("users").doc(email);
-
-        const userDoc = await userRef.get();
-        if (!userDoc.exists) {
-            return res.status(404).json({
-                success: false,
-                message: "User not found"
-            });
-        }
-
-        // Check if 2FA already enabled
-        const userData = userDoc.data();
-        if (userData.twoFactorEnabled) {
-            return res.json({
-                success: true,
-                alreadyEnabled: true,
-                message: "2FA already enabled"
-            });
-        }
-
-        // Generate new secret
-        const secret = speakeasy.generateSecret({
-            length: 20,
-            name: email,
-            issuer: "Blackjack Game"
-        });
-
-        // Generate QR code but don't store it
-        const qrCode = await qrcode.toDataURL(secret.otpauth_url);
-
-        // Only store the necessary secret
-        await userRef.update({
-            twoFactorEnabled: true,
-            twoFactorSecret: secret.base32, // Only store the base32 secret
-            twoFactorSetupDate: admin.firestore.FieldValue.serverTimestamp()
-        });
-
-        // Send both secret and QR code to frontend
-        return res.json({
-            success: true,
-            qrCode, // Send QR code for initial setup only
-            secret: secret.base32,
-            message: "2FA setup successful"
-        });
-
-    } catch (error) {
-        console.error('2FA Setup Error:', error);
-        return res.status(500).json({
-            success: false,
-            message: "Failed to setup 2FA",
-            error: error.message
-        });
-    }
-});
-
 // Test route to see if server is working
 app.get('/api/test', (req, res) => {
     res.json({ message: "Hello from the backend!" });
 });
 
-// Start the server
-app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-});
+// Only start server if this file is run directly
+if (require.main === module) {
+    app.listen(PORT, () => {
+        console.log(`Server running on port ${PORT}`);
+    });
+}
+
+module.exports = app;
