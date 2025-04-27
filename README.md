@@ -49,3 +49,9 @@ npm test
 
 ### Deployed game
 https://ace-up.vercel.app/game
+
+### Screencast Demonstration
+https://youtu.be/b54W-EXtST0 
+
+### Jira Board – Sprint Task Management
+https://atu-team-oegan8qg.atlassian.net/jira/software/projects/AC/list
